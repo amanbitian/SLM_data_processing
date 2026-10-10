@@ -1,0 +1,197 @@
+# ---------------------------------------------------------------------------
+# Data pipeline config. Every relative path is resolved against `data_root`
+# (inputs) or `out_root` (outputs). Override any key from the CLI:
+#   python -m slm_data all --config configs/data_config.yaml --set workers=12
+# Env overrides: SLM_DATA_ROOT, SLM_OUT_ROOT
+# ---------------------------------------------------------------------------
+data_root: "/Volumes/New Volume/training_data"      # Windows example: "E:/training_data"
+out_root: "artifacts/data"          # relative = inside this repository (SLM data cleaning_prep/artifacts/data);
+                                   # the training repository reads <out_root>/packed (env SLM_OUT_ROOT overrides)
+workers: 6                     # processes for parquet scanning / tokenization
+seed: 1234
+
+sources:
+  limit_row_groups: null         # smoke tests: e.g. 3 -> only first 3 row groups of each parquet
+  # resume text + OpenAI parse (source of truth for extraction)
+  # FIRST glob = newest export (turing_candidate_dataset, Oct 2026): its talent_ids are skipped in the older
+  # export below (prefer_first_source). Absolute paths are allowed. fired.parquet is deliberately not matched.
+  resume_parquet_globs:
+    - "/Volumes/New Volume/turing_candidate_dataset/resume_and other details/part_*.parquet"
+    - "resume_data/cluster_fraud_data_parquet/part_*.parquet"
+  prefer_first_source: true
+  t7_root: "/Volumes/New Volume/turing_candidate_dataset"     # work_experience/, education/, jd_resume_matching/
+  # corrected skill taxonomy (46,338 skills): skill linking, synonym de-duplication, knowledge cards
+  skill_taxonomy_csv: "/Volumes/New Volume/turing_candidate_dataset/Skill_Taxonomy_Corrected.csv"
+  # small, high-quality taxonomy extractions (gpt-5.x) — used as gold eval
+  taxonomy_extraction_jsons:
+    - "resume_extraction/output/all_candidates_gpt5.6_sol.json"
+    - "resume_extraction/output/all_candidatesV2gpt5.6.json"
+    - "resume_extraction/output/all_candidates_gpt5.6Terra.json"
+    - "resume_extraction/output/all_candidates_gpt5.4.json"
+  taxonomy_input_csv: "resume_extraction/input/selected_candidate_per_domain_resume.csv"
+  # query-paired relevance judgments (later stage)
+  relevance_parquet: "eval_consolidated/detailed_eval_consolidated.parquet"
+  # extra judged pairs from the evaluation/ runs (same judge column names; identical judgments collapse)
+  relevance_csv_globs:
+    - "evaluation/**/*.csv"
+  # external public data
+  external:
+    hf_jd_match_glob: "jd & Resume External/Hugging face esume-jd-match/*.parquet"
+    kaggle_resume_zip: "jd & Resume External/Resume.csv.zip"
+    job_desc_zip: "jd & Resume External/job_title_des.csv.zip"
+    candidate_role_csv: "jd & Resume External/candidate_job_role_dataset.csv"
+    # external_data_1010 (download_external_data.py): pretraining text only
+    djinni_jobs_glob: "external_data_1010/djinni_jobs/*.parquet"
+    djinni_profiles_glob: "external_data_1010/djinni_candidate_profiles/*.parquet"
+    # downloader folder first (resume_job_fit_merged_v1), then the older manual folder; the first that exists wins
+    resume_job_fit_glob: ["external_data_1010/resume_job_fit_merged_v1/train-*.parquet",
+                          "external_data_1010/resume_jd_hugging Face/train-*.parquet"]
+    wdc_glob: "external_data_1010/wdc_jobposting_2024-12/part_*.gz"
+    # general text (Turn 51): pretraining group `general` (Wikipedia articles about known entities -> `knowledge`)
+    wikipedia_glob: "external_data_1010/wikipedia_en/*.parquet"
+    fineweb_glob: "external_data_1010/fineweb_edu/*.parquet"
+    cosmopedia_glob: "external_data_1010/cosmopedia_v2/*.parquet"
+  # structured public data -> knowledge text + KB tables (`knowledge` step, Turn 51)
+  knowledge:
+    onet_zip: "external_data_1010/onet_31_0/db_31_0_text.zip"
+    talentclef_task_b_zip: "external_data_1010/talentclef/TaskB.zip"      # TRAINING files only
+    ror_zip_glob: "external_data_1010/ror/*ror-data.zip"
+    openalex_jsonl: "external_data_1010/openalex_institutions/institutions.jsonl.gz"
+    sec_tickers_json: "external_data_1010/sec_edgar/company_tickers_exchange.json"
+    wikidata_dir: "external_data_1010/wikidata"                           # empty until the re-download works
+
+cleaning:
+  min_resume_chars: 300
+  max_resume_chars: 240000         # ~64K tokens; the tokenizer budget (pack.max_seq_len) cuts precisely later
+  min_alpha_ratio: 0.55            # drop OCR garbage
+  min_ascii_ratio: 0.70            # crude non-English filter (set 0 to keep all languages)
+  redact_pii: true                 # emails/phones/urls/names -> placeholders (used when pii_mode: redact)
+  # pseudonymize = realistic fake name/e-mail/phone/LinkedIn per person with check codes (Turn 44); needs the
+  # secret env var SLM_PSEUDO_SALT. Relevance candidate blocks always use placeholders.
+  pii_mode: pseudonymize           # pseudonymize | redact
+  drop_on_leak: true               # drop a document if any known real value survives (and count it)
+  dedupe: true                     # talent_id + normalized-text hash
+
+extraction:
+  require_parse_status: null       # e.g. "done"; null = accept any non-empty parse
+  max_work_items: 12
+  max_education_items: 6
+  max_skills: 40
+  max_certifications: 8
+  include_descriptions: false      # true = longer targets with 1-line role summaries
+  min_grounding: 0.5               # fraction of companies/skills that must appear in resume text
+  max_examples: null               # cap (null = all)
+  include_contact: true            # add the injected pseudonyms as a "contact" field to extraction targets
+  link_skills: true                # collapse skill synonyms with the corrected taxonomy
+  domain_train_frac: 0.3           # share of the ~670K T7 domain labels used as train classification examples
+
+relevance:
+  min_agreement: 0.75              # weighted judge agreement required to keep a pair
+  min_weight: 0.9                  # minimum total judge weight behind a pair
+  allow_store_join: true           # fill missing resume text from resume_data by resume_id
+  max_per_query: 4000              # cap per query to avoid domination by a few queries
+  max_pos_neg_ratio: 3.0           # downsample majority class per query
+  # Splits come from the registry (splits: below): a candidate's pairs go to that candidate's split, for every
+  # query. Uncertain labels (a judge changed its verdict across runs, scores on both sides of 5, or low judge
+  # agreement) are kept as soft targets and flagged `risky` (soft) instead of being dropped (drop).
+  risky_policy: soft
+  near_dup_decontam: true          # drop TRAIN pairs whose candidate text near-duplicates a held-out candidate
+  near_dup_threshold: 0.8
+  reason_max_chars: 200
+  # Resume text placed in the candidate block. The judges that produced these labels saw only
+  # resume[:4000 chars] (production buildCandidateBlock), so 4000 keeps inputs faithful to labels.
+  # Raise it only for labels produced on full candidate dossiers (needed for true 64K relevance).
+  max_candidate_chars: 4000
+  # judge columns -> weight. verdict/score/reason/failed are column names in the parquet
+  judges:
+    - {name: gpt,         verdict: gpt_verdict,             score: gpt_score,          reason: gpt_reason,   weight: 1.0}
+    - {name: bench,       verdict: bench_verdict,           score: bench_score,        reason: bench_reason, failed: bench_failed, weight: 0.9}
+    - {name: primary,     verdict: verdict,                 score: score,              reason: reason,       failed: failed,       weight: 0.9}
+    - {name: independent, verdict: independent_verdict,     score: independent_score,                         weight: 0.9}
+    - {name: our,         verdict: our_verdict,             score: our_score,          reason: our_reason,   failed: our_failed,   weight: 0.8}
+    - {name: gemini_maj,  verdict: gemini_verdict_majority, score: gemini_score_mean,  weight: 0.8, require_true: gemini_verdict_stable}
+    - {name: gemini,      verdict: gemini_verdict,          score: gemini_score,       reason: gemini_reason, weight: 0.7}
+    - {name: gem_lite,    verdict: verdict_gemini_lite,     score: score_gemini_lite,  reason: reason_gemini_lite, failed: failed_gemini_lite, weight: 0.6}
+    - {name: gem_pro,     verdict: verdict_gemini,          score: score_gemini,       reason: reason_gemini,      failed: failed_gemini,      weight: 0.6}
+    - {name: flash,       verdict: verdict_flash,           score: score_flash,        reason: reason_flash,       failed: failed_flash,       weight: 0.6}
+    - {name: nano,        verdict: verdict_nano,            score: score_nano,         reason: reason_nano,        failed: failed_nano,        weight: 0.5}
+    - {name: screen,      verdict: screen_verdict,          score: screen_score,       reason: screen_reason,      weight: 0.4}
+
+# Leak audit (Turn 47)
+audit:
+  near_dup: true                   # MinHash near-duplicates: held-out vs training candidate texts
+  near_dup_threshold: 0.8
+  near_dup_max_docs: 200000
+
+# ---------------------------------------------------------------------------
+# Split registry (Turn 45): one split per talent_id for every task. See slm_data/registry.py.
+splits:
+  version: v1
+  salt: v1                         # change only to deliberately re-draw the split (then re-baseline everything)
+  test_candidates: 20000           # drawn across ALL queries of the relevance pool
+  min_test_per_query: 10
+  val_candidates: 10000            # split in two halves: val (calibration, early stopping) and dev (decisions)
+  dev_share_of_val: 0.5
+  min_val_per_query: 5
+  default_val_frac: 0.005          # every other candidate: 0.5% -> val (pretraining / extraction validation)
+  link_by_email: true              # accounts sharing an e-mail with a held-out person inherit its split
+  # QUERY axis (Turn 47): near-duplicate queries -> families -> train / dev / test by share of pairs.
+  # dev / test pairs = UNSEEN query families; val / dev_cand / test_cand = held-out candidates on seen queries.
+  test_query_frac: 0.10
+  dev_query_frac: 0.10
+  min_query_families: 2
+  strict_test: false               # true: test also needs an unseen candidate (else -> test_qonly slice)
+  query_family_overrides: null     # CSV query,value(=family name) after reviewing reports/query_families.csv
+  query_split_overrides: null      # CSV query,value(=train|dev|test)
+  exclude_email_patterns: ["@turing\\.com$", "\\+(test|qa)\\d*@"]
+  eval_assets:                     # evaluation data: never trained on
+    - {name: extraction_gold, path: "resume_extraction/input/selected_candidate_per_domain_resume.csv", id_col: resume_id}
+    - {name: extraction_gold_outputs, path: "resume_extraction/output/*.json", id_col: id}
+    - {name: curated_relevance, path: "curated_dataset/_tmp_relevance_296.csv", id_col: resume_id}
+    - {name: curated_extraction, path: "curated_dataset/_tmp_resume_extraction_250.csv", id_col: resume_id}
+    - {name: curated_fraud, path: "curated_dataset/_tmp_fraud_481.csv", id_col: talent_id}
+    - {name: curated_35, path: "curated_dataset_35/curated_eval_dataset_35.xlsx", id_cols: [resume_id, talent_id]}
+    - {name: fraud_sets, path: "id_universe/fraud_candidate_ids.csv", id_col: talent_id}
+    - {name: jd_resume_matching, path: "/Volumes/New Volume/turing_candidate_dataset/jd_resume_matching/*.parquet", id_col: talent_id}
+    # - {name: human_gold, path: "<your human gold set .jsonl>", id_cols: [resume_id, talent_id]}
+
+external:
+  use_hf_jd_match: true
+  use_kaggle_resume: true          # pretraining text + domain classification
+  use_job_descriptions: true       # pretraining text
+  use_candidate_role: true         # tiny role-classification task
+  use_djinni: true                 # 142K JDs + 210K anonymised profiles (MIT)
+  use_resume_job_fit: true         # med2425 resumes + JDs, text only (labels not trusted), de-duplicated
+  use_wdc: true                    # schema.org JobPosting from Common Crawl, English only, de-duplicated
+  wdc_max_docs_per_part: null      # cap per part file (null = all)
+  use_wikipedia: true              # ~4.8M articles (31 of 41 shards on disk)
+  use_fineweb: true                # FineWeb-Edu sample, ~2.9M docs
+  use_cosmopedia: true             # Cosmopedia v2, ~1.5M synthetic textbook pages
+  general_max_docs_per_file: null
+  min_doc_chars: 200
+
+tokenizer:
+  vocab_size: 32000
+  model_type: bpe                  # bpe | unigram
+  sample_docs: 400000              # docs sampled for tokenizer training
+  character_coverage: 0.9995
+  max_sentence_length: 16384
+
+pack:
+  max_seq_len: 65536               # 64K context (hybrid local/global model)
+  max_answer_tokens: 4096          # drop extraction examples whose target is longer
+  think_frac: 0.35                 # share of relevance pairs that also get a <|think|>...<|/think|> variant
+  teacher_weight: 0.5              # blend of teacher P(relevant) into the soft verdict target (if teacher labels exist)
+  pretrain_val_tokens: 2000000     # per pretraining group
+  # Turn 51: one token stream per group (packed/pretrain_<group>_{train,val}.bin). A `kind: pretrain` task
+  # without `stream` samples the groups with these weights (a task's own `mix:` overrides them per stage).
+  # knowledge is small (~50M tokens): keep its share low so it is not repeated more than ~4-5 times per stage
+  pretrain_mix: {resume: 0.50, jobs: 0.12, knowledge: 0.015, general: 0.365}
+  # Turn 53 (optimisation review)
+  global_dedupe_groups: [resume, jobs, knowledge, general]   # exact (normalised-text) dedupe ACROSS sources at pack time (disk-backed)
+  heldout_near_dup: true           # drop training docs that are MinHash near-copies of held-out text (test / eval people's
+  heldout_near_dup_groups: [resume]  #   resumes + held-out relevance candidates); checked in the encode workers
+  heldout_near_dup_threshold: 0.8
+  chars_per_token_estimate: 4.0    # val-budget estimate at queue time (the encoded count lags)
+  batch_max_chars: 2000000         # pretraining encode batches: <=256 docs AND <= this many characters
+  sft_batch_max_chars: 400000      # SFT encode batches: <=64 records AND <= this many characters
